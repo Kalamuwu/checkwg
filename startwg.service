@@ -1,0 +1,13 @@
+[Unit]
+Description=Check the wg status and restart it if necessary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/path/to/checkwg -c -1
+#LoadCredential=network.dns
+Restart=on-abnormal
+
+[Install]
+WantedBy=multi-user.target
