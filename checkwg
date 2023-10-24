@@ -1,0 +1,219 @@
+#!/bin/bash
+
+# The interface to connect to. Change this to change which wg config wg-quick will
+# attempt to use. Wireguard config should be at /etc/wireguard/<interface>.conf
+# where <interface> is the value below, e.x. my-vpn --> /etc/wireguard/my-vpn.conf
+INTERFACE="interface"
+
+suc() { echo -e "\e[32m[✓]\e[0m $@"; }
+log() { echo -e "\e[36m[.]\e[0m $@"; }
+log_no_dot() { echo "$@"; }
+err() { echo -e "\e[31m[!]\e[0m $@" 1>&2; }
+
+print_usage() {
+    if [ $1 == 0 ]; then
+        log_no_dot "checkwg: attempts to connect to vpn, and checks connection status afterward."
+    fi
+    log_no_dot "Usage: checkwg [-fhiqQrs] [-c NUM]"
+    log_no_dot ""
+    log_no_dot "    -c <NUM>  Number of times to attempt reconnection if final check fails."
+    log_no_dot "              Defaults to 3. Negative values will attempt infinitely."
+    log_no_dot ""
+    log_no_dot "    -f        Skip final connection check"
+    log_no_dot ""
+    log_no_dot "    -h        Display this message"
+    log_no_dot ""
+    log_no_dot "    -i        Skip initial wg check, force new connection. This can be dangerous"
+    log_no_dot "              if a connection is already found."
+    log_no_dot ""
+    log_no_dot "    -q        Quiet output, but show important status messages (implies -s)"
+    log_no_dot ""
+    log_no_dot "    -Q        Quiet output, do not output anything (implies -q)"
+    log_no_dot ""
+    log_no_dot "    -r        Reconnect. Disconnects existing connection and then connects"
+    log_no_dot "              normally."
+    log_no_dot ""
+    log_no_dot "    -s        Quiet subcommands. Show status messages, but not anything from wg"
+    log_no_dot "              or other subcommands"
+    exit $1
+}
+
+# parse incoming flags
+NESTCOUNT=3
+SKIPINITIAL=0
+SKIPFINAL=0
+QUIET=0
+ALLQUIET=0
+RECON=0
+
+while getopts ":hc:firQqs" opt; do
+    case ${opt} in
+        h)
+            print_usage 0
+            ;;
+        c)
+            NESTCOUNT=$OPTARG
+            ;;
+        f)
+            SKIPFINAL=1
+            ;;
+        i)
+            SKIPINITIAL=1
+            ;;
+        r)
+            RECON=1
+            ;;
+        Q)
+            ALLQUIET=1
+            unset err; err() { :; };
+            ;&
+        q)
+            QUIET=1
+            unset suc; suc() { :; };
+            unset log; log() { :; };
+            unset log_no_dot; log_no_dot() { :; };
+            ;&
+        s)
+            QUIETWG=1
+            ;;
+        :)
+            err "Invalid option: $OPTARG requires an argument"
+            print_usage 1
+            ;;
+       \?)
+            err "Invalid option: $OPTARG"
+            print_usage 1
+            ;;
+  esac
+done
+shift $((OPTIND -1))
+
+# check for invalid params
+if [ "$NESTCOUNT" == 0 ]; then
+    err "Invalid option: c cannot equal 0"
+    exit 1
+fi
+
+# check for permissions
+if [ "$EUID" -ne 0 ]; then
+    err "User does not have permission to use wg."
+    err "Hint: are you running this script as root?"
+    exit 2
+fi
+
+# initial check of wg connection. returns 0 if connection not found.
+initial_test() {
+    # connect anyways if -i flag set
+    if [ "$SKIPINITIAL" -ne 0 ]; then return 0; fi
+    
+    wgout=$(wg show)
+    if [[ ! -n $wgout ]]; then return 0; fi  # no active wg connection
+    return 1                                 # active wg connection found!
+}
+
+# connection cannot be established if rtlink is not ready.
+wait_until_rtlink_ready() {
+    sleeptime=1
+    rtnetlinkanswer=$(ip route | grep --invert-match linkdown)
+    while [[ ! -n $rtnetlinkanswer ]]
+    do
+        err "no ip routes found, waiting ${sleeptime} seconds."
+        sleep $sleeptime
+        sleeptime=$(( 2*$sleeptime ))
+        rtnetlinkanswer=$(ip route | grep --invert-match linkdown)
+    done
+
+    suc "ip route found, continuing."
+    #log "ip route returned:"
+    #log "$rtnetlinkanswer"
+}
+
+# establish connection.
+establish() {
+    log "Attempting to connect interface..."
+    if [ "$QUIETWG" == 1 ]; then
+        wg-quick up "$INTERFACE" > /dev/null 2>&1
+    else
+        wg-quick up "$INTERFACE"
+        suc "wg link connected."
+    fi
+}
+
+# disconnect from vpn. This allows reconnection to be achieved.
+disconnect() {
+    log "Attempting to disconnect interface..."
+    if [ "$QUIETWG" == 1 ]; then
+        wg-quick down "$INTERFACE" 1> /dev/null 2> /dev/null
+    else
+        wg-quick down "$INTERFACE"
+        suc "wg link disconnected."
+    fi
+}
+
+# check if connection is actually valid.
+final_test() {
+    # connect always if -f flag is set
+    if [ "$SKIPFINAL" -ne 0 ]; then return 0; fi
+    
+    log "Testing connection..."
+    # test connection
+    concheckping=$(ping 1.1.1.1 -c 2 -q -W 2)
+    if [[ "$concheckping" == *"0 received"* ]]; then
+        err "Connection not established!"
+        return 1
+    else
+        suc "Initial outbound connection good."
+        # test dns connection
+        dnscheckping=$(ping google.com -c 2 -q -W 2)
+        if [[ "$dnscheckping" == *"0 received"* ]]; then
+            err "DNS connection not established!"
+            return 1
+        else
+            # all good!
+            suc "DNS connection good."
+            return 0
+        fi
+    fi
+}
+
+# main loop
+if [ "$RECON" -ne 0 ]; then log "Attempting disconnect."; disconnect; fi
+initial_test
+if [[ "$?" == 0 ]]; then
+    log "wg appears down, reactivating..."
+    wait_until_rtlink_ready
+    
+    sleeptime_mainloop=1
+    errcount=0
+    while [ "$NESTCOUNT" -ne "$errcount" ]; do
+        establish
+        final_test
+        if [ "$?" -ne 0 ]; then
+            # connection not made. increment error count and sleep timer,
+            # then disconnect and try to reconnect.
+            errcount=$(( errcount + 1 ))
+            disconnect
+            log "Sleeping ${sleeptime_mainloop} seconds before attempting reconnect..."
+            sleep "$sleeptime_mainloop"
+            sleeptime_mainloop=$(( 2*sleeptime_mainloop ))
+        else
+            # we use explicit echo here instead of `suc` so that except for if
+            # the -Q flag is present, this message is still shown (so that -q
+            # flag does not hide this).
+            if [ "$ALLQUIET" == 0 ]; then
+                echo -e "\e[32m[✓]\e[0m Connection established"
+            fi
+            exit 0
+        fi
+    done
+    
+    # connection not established if we get to this point.
+    if [ "$ALLQUIET" == 0 ]; then\
+        # again, explicit echo here instead of `err` so that unless -Q flag
+        # present, this message is shown (-q will not hide).
+        echo -e "\e[36m[!]\e[0m Connection failed!"
+        exit 3
+    fi
+
+else log "wg is already up"
+fi
