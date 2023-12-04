@@ -2,8 +2,8 @@
 
 # The interface to connect to. Change this to change which wg config wg-quick will
 # attempt to use. Wireguard config should be at /etc/wireguard/<interface>.conf
-# where <interface> is the value below, e.x. my-vpn --> /etc/wireguard/my-vpn.conf
-INTERFACE="interface"
+# where <interface> is the value below, e.x. US-NY --> /etc/wireguard/US-NY.conf
+INTERFACE="US-NY"
 
 suc() { echo -e "\e[32m[✓]\e[0m $@"; }
 log() { echo -e "\e[36m[.]\e[0m $@"; }
@@ -119,7 +119,7 @@ wait_until_rtlink_ready() {
     do
         err "no ip routes found, waiting ${sleeptime} seconds."
         sleep $sleeptime
-        sleeptime=$(( 2*$sleeptime ))
+        sleeptime=$(( sleeptime < 4 ? sleeptime*2 : 8 ))
         rtnetlinkanswer=$(ip route | grep --invert-match linkdown)
     done
 
@@ -139,7 +139,7 @@ establish() {
     fi
 }
 
-# disconnect from vpn. This allows reconnection to be achieved.
+# disconnect from interface. This allows reconnection.
 disconnect() {
     log "Attempting to disconnect interface..."
     if [ "$QUIETWG" == 1 ]; then
@@ -176,44 +176,53 @@ final_test() {
     fi
 }
 
-# main loop
-if [ "$RECON" -ne 0 ]; then log "Attempting disconnect."; disconnect; fi
-initial_test
-if [[ "$?" == 0 ]]; then
-    log "wg appears down, reactivating..."
-    wait_until_rtlink_ready
-    
-    sleeptime_mainloop=1
-    errcount=0
-    while [ "$NESTCOUNT" -ne "$errcount" ]; do
-        establish
-        final_test
-        if [ "$?" -ne 0 ]; then
-            # connection not made. increment error count and sleep timer,
-            # then disconnect and try to reconnect.
-            errcount=$(( errcount + 1 ))
-            disconnect
-            log "Sleeping ${sleeptime_mainloop} seconds before attempting reconnect..."
-            sleep "$sleeptime_mainloop"
-            sleeptime_mainloop=$(( 2*sleeptime_mainloop ))
-        else
-            # we use explicit echo here instead of `suc` so that except for if
-            # the -Q flag is present, this message is still shown (so that -q
-            # flag does not hide this).
-            if [ "$ALLQUIET" == 0 ]; then
-                echo -e "\e[32m[✓]\e[0m Connection established"
-            fi
-            exit 0
-        fi
-    done
-    
-    # connection not established if we get to this point.
-    if [ "$ALLQUIET" == 0 ]; then\
-        # again, explicit echo here instead of `err` so that unless -Q flag
-        # present, this message is shown (-q will not hide).
-        echo -e "\e[36m[!]\e[0m Connection failed!"
-        exit 3
+# successful connection exit func
+exit_suc() {
+    # we use explicit echo here instead of `suc` so that except for if
+    # the -Q flag is present, this message is still shown (so that -q
+    # flag does not hide this).
+    if [ "$ALLQUIET" -eq 0 ]; then
+       echo -e "\e[32m[✓]\e[0m Connection established"
     fi
+    exit 0
+}
+
+# unsuccessful connection exit func
+exit_unsuc() {
+    # again, explicit echo here instead of `err` so that unless -Q flag
+    # present, this message is shown (-q will not hide).
+    if [ "$ALL_QUIET" -eq 0 ]; then
+        echo -e "\e[36m[!]\e[0m Connection failed!"
+    fi
+    exit $1
+}
+
+# initial tests
+if [ "$RECON" -ne 0 ]; then disconnect; fi
+initial_test
+if [[ "$?" -ne 0 ]]; then log "wg is already up"; exit 0; fi
+
+log "wg appears down, reactivating..."
+wait_until_rtlink_ready
+
+# main connect loop
+sleeptime_mainloop=1
+errcount=0
+while [ "$NESTCOUNT" -ne "$errcount" ]; do
+    establish
+    final_test
+    if [ "$?" -eq 0 ]; then exit_suc; fi
+    # connection not made. increment error count and sleep timer,
+    # then disconnect and try to reconnect.
+    errcount=$(( errcount + 1 ))
+    disconnect
+    log "Sleeping ${sleeptime_mainloop} seconds before attempting reconnect..."
+    sleep "$sleeptime_mainloop"
+    sleeptime_mainloop=$(( sleeptime_mainloop < 16 ? sleeptime_mainloop*2 : 16 ))
+done
+
+# connection not established if we get to this point.
+exit_unsuc 3
 
 else log "wg is already up"
 fi
